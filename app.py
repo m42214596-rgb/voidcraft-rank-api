@@ -1,15 +1,21 @@
 from flask import Flask, request, jsonify
 import os
+import threading
+import uuid
 
 app = Flask(__name__)
 
 BRIDGE_KEY = os.environ.get("BRIDGE_KEY")
 
 orders = []
+lock = threading.Lock()
 
 
 def authorized():
-    return request.headers.get("X-Bridge-Key") == BRIDGE_KEY
+    return (
+        BRIDGE_KEY
+        and request.headers.get("X-Bridge-Key") == BRIDGE_KEY
+    )
 
 
 @app.route("/", methods=["GET"])
@@ -21,6 +27,72 @@ def home():
     })
 
 
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "ok": True,
+        "status": "healthy"
+    })
+
+
+# سایت سفارش جدید را اینجا ارسال می‌کند
+@app.route("/create", methods=["POST"])
+def create_order():
+    if not authorized():
+        return jsonify({
+            "ok": False,
+            "error": "Access denied"
+        }), 403
+
+    data = request.get_json(silent=True) or {}
+
+    username = str(data.get("minecraft_username", "")).strip()
+    rank = str(data.get("rank_name", "")).strip()
+    amount = data.get("amount")
+    website_order_id = data.get("website_order_id")
+
+    if not username:
+        return jsonify({
+            "ok": False,
+            "error": "minecraft_username is required"
+        }), 400
+
+    if not rank:
+        return jsonify({
+            "ok": False,
+            "error": "rank_name is required"
+        }), 400
+
+    with lock:
+        # جلوگیری از ثبت دوباره یک سفارش سایت
+        if website_order_id is not None:
+            for old_order in orders:
+                if old_order.get("website_order_id") == website_order_id:
+                    return jsonify({
+                        "ok": True,
+                        "duplicate": True,
+                        "order": old_order
+                    })
+
+        order = {
+            "id": str(uuid.uuid4()),
+            "website_order_id": website_order_id,
+            "minecraft_username": username,
+            "rank_name": rank,
+            "amount": amount,
+            "status": "paid",
+            "error": None
+        }
+
+        orders.append(order)
+
+    return jsonify({
+        "ok": True,
+        "order": order
+    }), 201
+
+
+# Bridge سفارش‌های پرداخت‌شده را می‌گیرد
 @app.route("/queue", methods=["GET"])
 def queue():
     if not authorized():
@@ -29,49 +101,20 @@ def queue():
             "error": "Access denied"
         }), 403
 
-    return jsonify({
-        "ok": True,
-        "orders": orders
-    })
-
-
-@app.route("/create", methods=["GET"])
-def create():
-    if not authorized():
-        return jsonify({
-            "ok": False,
-            "error": "Access denied"
-        }), 403
-
-    username = request.args.get("username")
-    rank = request.args.get("rank")
-    amount = request.args.get("amount")
-
-    if not username or not rank:
-        return jsonify({
-            "ok": False,
-            "error": "username and rank are required"
-        }), 400
-
-    order_id = len(orders) + 1
-
-    order = {
-        "id": order_id,
-        "minecraft_username": username,
-        "rank_name": rank,
-        "amount": amount,
-        "status": "paid"
-    }
-
-    orders.append(order)
+    with lock:
+        pending = [
+            order for order in orders
+            if order["status"] == "paid"
+        ]
 
     return jsonify({
         "ok": True,
-        "order": order
+        "orders": pending
     })
 
 
-@app.route("/complete", methods=["GET"])
+# Bridge نتیجه اجرای LuckPerms را اعلام می‌کند
+@app.route("/complete", methods=["POST"])
 def complete():
     if not authorized():
         return jsonify({
@@ -79,24 +122,56 @@ def complete():
             "error": "Access denied"
         }), 403
 
-    order_id = request.args.get("order_id")
-    success = request.args.get("ok") == "1"
-    error = request.args.get("error", "")
+    data = request.get_json(silent=True) or {}
 
-    for order in orders:
-        if str(order["id"]) == str(order_id):
+    order_id = str(data.get("order_id", "")).strip()
+    success = bool(data.get("success"))
+    error = str(data.get("error", "")).strip()
 
-            if success:
-                order["status"] = "completed"
-                order["error"] = None
-            else:
-                order["status"] = "error"
-                order["error"] = error or "Unknown error"
+    if not order_id:
+        return jsonify({
+            "ok": False,
+            "error": "order_id is required"
+        }), 400
 
-            return jsonify({
-                "ok": True,
-                "order": order
-            })
+    with lock:
+        for order in orders:
+            if str(order["id"]) == order_id:
+
+                if success:
+                    order["status"] = "completed"
+                    order["error"] = None
+                else:
+                    order["status"] = "paid"
+                    order["error"] = error or "Unknown error"
+
+                return jsonify({
+                    "ok": True,
+                    "order": order
+                })
+
+    return jsonify({
+        "ok": False,
+        "error": "Order not found"
+    }), 404
+
+
+# مشاهده یک سفارش برای مدیریت/بررسی
+@app.route("/order/<order_id>", methods=["GET"])
+def get_order(order_id):
+    if not authorized():
+        return jsonify({
+            "ok": False,
+            "error": "Access denied"
+        }), 403
+
+    with lock:
+        for order in orders:
+            if str(order["id"]) == str(order_id):
+                return jsonify({
+                    "ok": True,
+                    "order": order
+                })
 
     return jsonify({
         "ok": False,
@@ -106,4 +181,7 @@ def complete():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
